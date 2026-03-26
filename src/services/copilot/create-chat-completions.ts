@@ -1,25 +1,12 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
 
-import type { SubagentMarker } from "~/routes/messages/subagent-marker"
-
-import {
-  copilotBaseUrl,
-  copilotHeaders,
-  prepareForCompact,
-  prepareInteractionHeaders,
-} from "~/lib/api-config"
+import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
-  options: {
-    subagentMarker?: SubagentMarker | null
-    requestId: string
-    sessionId?: string
-    isCompact?: boolean
-  },
 ) => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
@@ -29,31 +16,19 @@ export const createChatCompletions = async (
       && x.content?.some((x) => x.type === "image_url"),
   )
 
-  // Agent/user check for x-initiator header
+  // Agent/user check for X-Initiator header
   // Determine if any message is from an agent ("assistant" or "tool")
-  // Refactor `isAgentCall` logic to check only the last message in the history rather than any message. This prevents valid user messages from being incorrectly flagged as agent calls due to previous assistant history, ensuring proper credit consumption for multi-turn conversations.
-  let isAgentCall = false
-  if (payload.messages.length > 0) {
-    const lastMessage = payload.messages.at(-1)
-    if (lastMessage) {
-      isAgentCall = ["assistant", "tool"].includes(lastMessage.role)
-    }
-  }
-
-  // Build headers and add x-initiator
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, options.requestId, enableVision),
-    "x-initiator": isAgentCall ? "agent" : "user",
-  }
-
-  prepareInteractionHeaders(
-    options.sessionId,
-    Boolean(options.subagentMarker),
-    headers,
+  const isAgentCall = payload.messages.some((msg) =>
+    ["assistant", "tool"].includes(msg.role),
   )
 
-  prepareForCompact(headers, options.isCompact)
+  // Build headers and add X-Initiator
+  const headers: Record<string, string> = {
+    ...copilotHeaders(state, enableVision),
+    "X-Initiator": isAgentCall ? "agent" : "user",
+  }
 
+  consola.info("MODEL BEING SENT:", payload.model)
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
@@ -95,7 +70,7 @@ export interface ChatCompletionChunk {
   }
 }
 
-export interface Delta {
+interface Delta {
   content?: string | null
   role?: "user" | "assistant" | "system" | "tool"
   tool_calls?: Array<{
@@ -107,11 +82,9 @@ export interface Delta {
       arguments?: string
     }
   }>
-  reasoning_text?: string | null
-  reasoning_opaque?: string | null
 }
 
-export interface Choice {
+interface Choice {
   index: number
   delta: Delta
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter" | null
@@ -140,8 +113,6 @@ export interface ChatCompletionResponse {
 interface ResponseMessage {
   role: "assistant"
   content: string | null
-  reasoning_text?: string | null
-  reasoning_opaque?: string | null
   tool_calls?: Array<ToolCall>
 }
 
@@ -178,7 +149,6 @@ export interface ChatCompletionsPayload {
     | { type: "function"; function: { name: string } }
     | null
   user?: string | null
-  thinking_budget?: number
 }
 
 export interface Tool {
@@ -197,8 +167,6 @@ export interface Message {
   name?: string
   tool_calls?: Array<ToolCall>
   tool_call_id?: string
-  reasoning_text?: string | null
-  reasoning_opaque?: string | null
 }
 
 export interface ToolCall {

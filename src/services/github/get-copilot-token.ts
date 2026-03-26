@@ -1,10 +1,10 @@
-import { getGitHubApiBaseUrl, githubHeaders } from "~/lib/api-config"
+import { GITHUB_API_BASE_URL, githubHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
 export const getCopilotToken = async () => {
   const response = await fetch(
-    `${getGitHubApiBaseUrl()}/copilot_internal/v2/token`,
+    `${GITHUB_API_BASE_URL}/copilot_internal/v2/token`,
     {
       headers: githubHeaders(state),
     },

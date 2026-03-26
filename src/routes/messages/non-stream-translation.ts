@@ -1,6 +1,3 @@
-import type { Model } from "~/services/copilot/get-models"
-
-import { state } from "~/lib/state"
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -10,10 +7,12 @@ import {
   type Tool,
   type ToolCall,
 } from "~/services/copilot/create-chat-completions"
+import { state } from "~/lib/state"
 
 import {
   type AnthropicAssistantContentBlock,
   type AnthropicAssistantMessage,
+  type AnthropicMessage,
   type AnthropicMessagesPayload,
   type AnthropicResponse,
   type AnthropicTextBlock,
@@ -26,22 +25,16 @@ import {
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
-// Compatible with opencode, it will filter out blocks where the thinking text is empty, so we need add a default thinking text
-export const THINKING_TEXT = "Thinking..."
-
 // Payload translation
+
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
 ): ChatCompletionsPayload {
-  const modelId = payload.model
-  const model = state.models?.data.find((m) => m.id === modelId)
-  const thinkingBudget = getThinkingBudget(payload, model)
   return {
-    model: modelId,
+    model: translateModelName(payload.model),
     messages: translateAnthropicMessagesToOpenAI(
-      payload,
-      modelId,
-      thinkingBudget,
+      payload.messages,
+      payload.system,
     ),
     max_tokens: payload.max_tokens,
     stop: payload.stop_sequences,
@@ -51,43 +44,39 @@ export function translateToOpenAI(
     user: payload.metadata?.user_id,
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
-    thinking_budget: thinkingBudget,
   }
 }
 
-function getThinkingBudget(
-  payload: AnthropicMessagesPayload,
-  model: Model | undefined,
-): number | undefined {
-  const thinking = payload.thinking
-  if (model && thinking) {
-    const maxThinkingBudget = Math.min(
-      model.capabilities.supports.max_thinking_budget ?? 0,
-      (model.capabilities.limits.max_output_tokens ?? 0) - 1,
-    )
-    thinking.budget_tokens ??= maxThinkingBudget
-    if (maxThinkingBudget > 0) {
-      const budgetTokens = Math.min(thinking.budget_tokens, maxThinkingBudget)
-      return Math.max(
-        budgetTokens,
-        model.capabilities.supports.min_thinking_budget ?? 1024,
+function translateModelName(model: string): string {
+    const match = model.match(/^(claude-[a-z]+-\d+)-\d{6,}.*$/)
+  if (match) {
+    const baseModel = match[1] 
+        if (state.models?.data) {
+      const bestMatch = state.models.data.find(
+        (m) => m.id === baseModel || m.id.startsWith(baseModel + ".")
       )
+      if (bestMatch) {
+        return bestMatch.id
+      }
     }
+    return baseModel
   }
-  return undefined
+  return model
 }
+
 
 function translateAnthropicMessagesToOpenAI(
-  payload: AnthropicMessagesPayload,
-  modelId: string,
-  _thinkingBudget: number | undefined,
+  anthropicMessages: Array<AnthropicMessage>,
+  system: string | Array<AnthropicTextBlock> | undefined,
 ): Array<Message> {
-  const systemMessages = handleSystemPrompt(payload.system)
-  const otherMessages = payload.messages.flatMap((message) =>
+  const systemMessages = handleSystemPrompt(system)
+
+  const otherMessages = anthropicMessages.flatMap((message) =>
     message.role === "user" ?
       handleUserMessage(message)
-    : handleAssistantMessage(message, modelId),
+    : handleAssistantMessage(message),
   )
+
   return [...systemMessages, ...otherMessages]
 }
 
@@ -101,11 +90,7 @@ function handleSystemPrompt(
   if (typeof system === "string") {
     return [{ role: "system", content: system }]
   } else {
-    const systemText = system
-      .map((block) => {
-        return block.text
-      })
-      .join("\n\n")
+    const systemText = system.map((block) => block.text).join("\n\n")
     return [{ role: "system", content: systemText }]
   }
 }
@@ -149,7 +134,6 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
 
 function handleAssistantMessage(
   message: AnthropicAssistantMessage,
-  modelId: string,
 ): Array<Message> {
   if (!Array.isArray(message.content)) {
     return [
@@ -164,37 +148,25 @@ function handleAssistantMessage(
     (block): block is AnthropicToolUseBlock => block.type === "tool_use",
   )
 
-  let thinkingBlocks = message.content.filter(
+  const textBlocks = message.content.filter(
+    (block): block is AnthropicTextBlock => block.type === "text",
+  )
+
+  const thinkingBlocks = message.content.filter(
     (block): block is AnthropicThinkingBlock => block.type === "thinking",
   )
 
-  if (modelId.startsWith("claude")) {
-    thinkingBlocks = thinkingBlocks.filter(
-      (b) =>
-        b.thinking
-        && b.thinking !== THINKING_TEXT
-        && b.signature
-        // gpt signature has @ in it, so filter those out for claude models
-        && !b.signature.includes("@"),
-    )
-  }
-
-  const thinkingContents = thinkingBlocks
-    .filter((b) => b.thinking && b.thinking !== THINKING_TEXT)
-    .map((b) => b.thinking)
-
-  const allThinkingContent =
-    thinkingContents.length > 0 ? thinkingContents.join("\n\n") : undefined
-
-  const signature = thinkingBlocks.find((b) => b.signature)?.signature
+  // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
+  const allTextContent = [
+    ...textBlocks.map((b) => b.text),
+    ...thinkingBlocks.map((b) => b.thinking),
+  ].join("\n\n")
 
   return toolUseBlocks.length > 0 ?
       [
         {
           role: "assistant",
-          content: mapContent(message.content),
-          reasoning_text: allThinkingContent,
-          reasoning_opaque: signature,
+          content: allTextContent || null,
           tool_calls: toolUseBlocks.map((toolUse) => ({
             id: toolUse.id,
             type: "function",
@@ -209,8 +181,6 @@ function handleAssistantMessage(
         {
           role: "assistant",
           content: mapContent(message.content),
-          reasoning_text: allThinkingContent,
-          reasoning_opaque: signature,
         },
       ]
 }
@@ -230,8 +200,11 @@ function mapContent(
   const hasImage = content.some((block) => block.type === "image")
   if (!hasImage) {
     return content
-      .filter((block): block is AnthropicTextBlock => block.type === "text")
-      .map((block) => block.text)
+      .filter(
+        (block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
+          block.type === "text" || block.type === "thinking",
+      )
+      .map((block) => (block.type === "text" ? block.text : block.thinking))
       .join("\n\n")
   }
 
@@ -240,6 +213,12 @@ function mapContent(
     switch (block.type) {
       case "text": {
         contentParts.push({ type: "text", text: block.text })
+
+        break
+      }
+      case "thinking": {
+        contentParts.push({ type: "text", text: block.thinking })
+
         break
       }
       case "image": {
@@ -249,6 +228,7 @@ function mapContent(
             url: `data:${block.source.media_type};base64,${block.source.data}`,
           },
         })
+
         break
       }
       // No default
@@ -268,22 +248,9 @@ function translateAnthropicToolsToOpenAI(
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: normalizeToolSchema(tool.input_schema),
+      parameters: tool.input_schema,
     },
   }))
-}
-
-/**
- * Ensures `type: "object"` schema has a `properties` field.
- * OpenAI's API rejects object schemas without it.
- */
-export const normalizeToolSchema = (
-  schema: Record<string, unknown>,
-): Record<string, unknown> => {
-  if (schema.type === "object" && !schema.properties) {
-    return { ...schema, properties: {} }
-  }
-  return schema
 }
 
 function translateAnthropicToolChoiceToOpenAI(
@@ -324,19 +291,19 @@ export function translateToAnthropic(
   response: ChatCompletionResponse,
 ): AnthropicResponse {
   // Merge content from all choices
-  const assistantContentBlocks: Array<AnthropicAssistantContentBlock> = []
-  let stopReason = response.choices[0]?.finish_reason ?? null
+  const allTextBlocks: Array<AnthropicTextBlock> = []
+  const allToolUseBlocks: Array<AnthropicToolUseBlock> = []
+  let stopReason: "stop" | "length" | "tool_calls" | "content_filter" | null =
+    null // default
+  stopReason = response.choices[0]?.finish_reason ?? stopReason
 
   // Process all choices to extract text and tool use blocks
   for (const choice of response.choices) {
     const textBlocks = getAnthropicTextBlocks(choice.message.content)
-    const thinkBlocks = getAnthropicThinkBlocks(
-      choice.message.reasoning_text,
-      choice.message.reasoning_opaque,
-    )
     const toolUseBlocks = getAnthropicToolUseBlocks(choice.message.tool_calls)
 
-    assistantContentBlocks.push(...thinkBlocks, ...textBlocks, ...toolUseBlocks)
+    allTextBlocks.push(...textBlocks)
+    allToolUseBlocks.push(...toolUseBlocks)
 
     // Use the finish_reason from the first choice, or prioritize tool_calls
     if (choice.finish_reason === "tool_calls" || stopReason === "stop") {
@@ -344,12 +311,14 @@ export function translateToAnthropic(
     }
   }
 
+  // Note: GitHub Copilot doesn't generate thinking blocks, so we don't include them in responses
+
   return {
     id: response.id,
     type: "message",
     role: "assistant",
     model: response.model,
-    content: assistantContentBlocks,
+    content: [...allTextBlocks, ...allToolUseBlocks],
     stop_reason: mapOpenAIStopReasonToAnthropic(stopReason),
     stop_sequence: null,
     usage: {
@@ -369,7 +338,7 @@ export function translateToAnthropic(
 function getAnthropicTextBlocks(
   messageContent: Message["content"],
 ): Array<AnthropicTextBlock> {
-  if (typeof messageContent === "string" && messageContent.length > 0) {
+  if (typeof messageContent === "string") {
     return [{ type: "text", text: messageContent }]
   }
 
@@ -379,31 +348,6 @@ function getAnthropicTextBlocks(
       .map((part) => ({ type: "text", text: part.text }))
   }
 
-  return []
-}
-
-function getAnthropicThinkBlocks(
-  reasoningText: string | null | undefined,
-  reasoningOpaque: string | null | undefined,
-): Array<AnthropicThinkingBlock> {
-  if (reasoningText && reasoningText.length > 0) {
-    return [
-      {
-        type: "thinking",
-        thinking: reasoningText,
-        signature: reasoningOpaque || "",
-      },
-    ]
-  }
-  if (reasoningOpaque && reasoningOpaque.length > 0) {
-    return [
-      {
-        type: "thinking",
-        thinking: THINKING_TEXT, // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we add a default thinking text here
-        signature: reasoningOpaque,
-      },
-    ]
-  }
   return []
 }
 
